@@ -3,7 +3,7 @@
 # Sources (a full scan, not relying on file names): every file under RomFS (a zstd file is decompressed first, whatever its name: Mario's .zs, Paper Mario: The Thousand-Year Door's .zst; Yaz0 is decompressed, SARC is expanded member by member) and ExeFS main (NSO, lz4-decompressed), looking for
 #   · BNSH ('BNSH\0\0\0\0', carried by bfsha / particle effect esetb / UI layout blarc / embedded in main):
 #       +0x60 grsc block; +0x7c variation count u32; +0x80 variation table pointer (pointers are relative to the BNSH start). A variation is 0x40 bytes; the binary program is at +0x10;
-#       the binary program has 6 stage pointers from +0x08: vertex, hull, domain, geometry, pixel, compute; the stage code descriptor has +0x08 control pointer, +0x10 code area pointer, +0x18 code area length, +0x1c control length.
+#       the binary program has 6 stage pointers from +0x08: vertex, hull, domain, geometry, pixel, compute; NVN2 adds ray tracing at +0x38 and task/mesh at +0x40/+0x48. The stage code descriptor has +0x08 control pointer, +0x10 code area pointer, +0x18 code area length, +0x1c control length.
 #   · BAHS (agl's sharcb: the agl / gsys resource packs, GameAglShader in the Secred pack): file header +0x1c code region start, +0x18 code region length;
 #       each binary entry in the table area is 16 bytes {code offset (relative to the code region, 0x100-aligned), 0, control length 0x880 / 0x88c (3D World 0x848), signed offset of the control relative to this entry's address}.
 #       Control sections are shared between programs, so pairing goes by entry, never by finding code from a control; entries are recognized by a triple check of "control magic + code magic + consistent lengths".
@@ -41,12 +41,14 @@
 #   · SNVN (Retro Studios, Donkey Kong Country: Tropical Freeze, Metroid Prime Remastered): zlib program records in the SNVN chunks of MaterialArchive.arc, of the MTRL resources in its
 #       .pak archives and of the startup material archive LZSS-compressed in main, see rfrm_shaders and retro_main_forms
 #   · BERG (Snowdrop, Mario + Rabbids Sparks of Hope): shader objects in the individually zstd-compressed records of its SDF data slices, see snowdrop_shaders
-#   · bnd2 (Criterion's Bundle 2, Need for Speed: Hot Pursuit Remastered): whole GLSLC outputs in the zlib resources of SHADERS.BNDL, see bnd2_resources and bnd2_shaders
+#   · bnd2 (Criterion's Bundle 2: Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): whole GLSLC outputs in its zlib resources, see bnd2_resources and bnd2_shaders
 #   · Heaps (Dead Cells): whole GLSLC outputs in base64 after the GLSL of the engine's shader cache (shaders.cache.nx), inside its PAK archive, see heaps_pak_files and heaps_shaders
 #   · Frostbite (EA SPORTS FC 27): the CompiledBytecode resources of the bundles its superbundle tables (.toc) list, in its cas files (Oodle Leviathan, decoded by the game's own decoder in the
 #       Mac host), each a VNVN record with one code area and control section (frostbite.py), see frostbite_jobs and frostbite_shaders
 #   · PDAT (the engine with the namespace phx, Kirby Air Riders): flatbuffer records tagged PMAP, zstd frames in the .dat archives, each holding a program's control sections and code areas, see pdat_jobs and pdat_shaders
 #   · Unreal Engine 3 (Batman: Arkham Knight): shader records in its global shader cache (BMSG) and in the packages (the combined shader cache), whose compressed chunks are Oodle blocks decoded by the game's own decoder in the Mac host, see ue3_body and ue3_shaders
+#   · CIVBSF (Firaxis, Civilization VI / VII): indexed NVBC / GLSLC or code/control payloads, see civbsf_shaders
+#   · IPK (Ubisoft's UbiArt, Rayman Legends: Definitive Edition): whole GLSLC outputs in the .fxb effect files of bundle_nn.ipk (zlib entries), see ipk_shaders
 # Code area: 0x30 header + (graphics) 0x50 SPH + instructions; header magic 0x12345678 for graphics, 0x12345679 for compute. The control section starts with 0x98761234, +0x704 = code area length,
 #   +0x700 = start of the c1 constant segment within the code area; for compute +0x748 thread group xyz (u32 ×3), +0x754 shared memory bytes (checked one by one against PC reflection on D2R's 22 compute shaders).
 # Stage: BNSH uses the stage slot; BAHS uses bits 10..13 of SPH word 0 (1 vertex 2 hull 3 domain 4 geometry 5 pixel), and a compute header means compute.
@@ -82,7 +84,7 @@ def sph_stage(code):
     if len(code) < 0x34: return None   # shorter than the header and SPH word 0
     w = struct.unpack_from('<I', code, 0x30)[0]
     return 'vs' if (w >> 10) & 0xf == 0 and w & 0x1f == 1 else SPH_STAGE.get((w >> 10) & 0xf)
-STAGE_NAME = {'vs': 'vertex', 'hs': 'hull', 'ds': 'domain', 'gs': 'geometry', 'ps': 'pixel', 'cs': 'compute', 'ts': 'task', 'ms': 'mesh'}   # shader_map.tsv column 3
+STAGE_NAME = {'vs': 'vertex', 'hs': 'hull', 'ds': 'domain', 'gs': 'geometry', 'ps': 'pixel', 'cs': 'compute', 'ts': 'task', 'ms': 'mesh', 'rt': 'raytracing'}   # shader_map.tsv column 3
 
 def red(msg) -> NoReturn: sys.exit('[RED] ' + msg)
 
@@ -131,6 +133,12 @@ def same_shader(a, b):
     """Two copies of one key hold the same shader: the code areas are equal, and so are the control sections up to their own length (control +0x20). Pokémon Legends: Z-A's UI layout archives
     (__ArchiveShader.bnsh inside the .truiv packs) give 104 KB control sections whose stage descriptor length runs 456 bytes past their own length, and those trailing bytes differ between copies"""
     (ca, ka), (cb, kb) = a, b
+    if any(nvn2_ctl(c) and len(c) > 0x56 and c[0x56] == 8 for c in (ca, cb)):
+        # RT entries, continuations and resources are serialized after the
+        # standard key's first 0x48 control bytes. Equal keys/code can still have
+        # different execution semantics. Mask only the declared section length,
+        # as the runtime key does; never discard conflicting RT metadata.
+        return ka == kb and ca[:0x30] + bytes(4) + ca[0x34:] == cb[:0x30] + bytes(4) + cb[0x34:]
     n = struct.unpack_from('<I', ca, 0x20)[0] if len(ca) >= 0x24 else len(ca)
     n = n if 0x760 <= n <= min(len(ca), len(cb)) else max(len(ca), len(cb))
     if nvn2_ctl(ca): return ka == kb and key_ctl(ca) == key_ctl(cb)
@@ -141,6 +149,14 @@ def same_shader(a, b):
 def check(where, st, ctl, code):
     """control section and code area consistent; returns the reason if not"""
     if ctl[:4] != CTL_MAGIC or len(ctl) < 0x24 or len(ctl) < ctl_len(ctl): return 'bad control section'
+    if st == 'rt':
+        from dmsh_rt import InvalidModule, parse_module
+        if not nvn2_ctl(ctl) or len(ctl) < 0x68 or ctl[0x56] != 8: return 'bad NVN2 ray-tracing control section'
+        nmeta, pmeta, ncode = struct.unpack_from('<III', ctl, 0x5c)
+        if ncode != len(code): return 'RT control +0x64 does not match the code area length'
+        if not nmeta or pmeta < 0x68 or pmeta % 8 or pmeta > len(ctl) or nmeta > len(ctl) - pmeta: return 'RT metadata range lies outside the control section'
+        try: parse_module(ctl[pmeta:pmeta + nmeta], code)
+        except InvalidModule as e: return f'invalid RT metadata: {e}'
     if nvn2_ctl(ctl):   # NVN2: Ampere code, a 0x80-byte SPH and no code header; the control section names the code area's length at +0x44 (dmsh_ampere.py)
         return None if struct.unpack_from('<I', ctl, 0x44)[0] == len(code) else 'control +0x44 does not match the code area length'
     # a compute code area may have no header (SDK 10's Super Mario 3D World + Bowser's Fury and D2R: instructions start at +0; dmsh_build strips only a 0x12345679 header)
@@ -164,6 +180,20 @@ def bnsh_shaders(d, base, label):
             why = check(label, st, ctl, code)
             if why: red(f'{label} BNSH @{base:#x} variation {v} {st}: {why}')
             out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
+        # Older programs end at +0x38. Only a pointer whose control header
+        # actually identifies NVN2 stage8 admits this optional RT descriptor;
+        # after that identification, malformed lengths/metadata are errors.
+        if base + prog + 0x40 <= len(d):
+            sc = struct.unpack_from('<Q', d, base + prog + 0x38)[0]
+            if sc and base + sc + 0x20 <= len(d):
+                pctl, pcode, ncode, nctl = struct.unpack_from('<QQII', d, base + sc + 8)
+                prefix = d[base + pctl:base + pctl + 0x57]
+                if nvn2_ctl(prefix) and len(prefix) == 0x57 and prefix[0x56] == 8:
+                    ctl = span(d, base + pctl, nctl, f'{where} variation {v} rt control section')
+                    code = span(d, base + pcode, ncode, f'{where} variation {v} rt code area')
+                    why = check(label, 'rt', ctl, code)
+                    if why: red(f'{where} variation {v} rt: {why}')
+                    out.append((f'{label}#BNSH@{base:#x}#var{v}', 'rt', ctl, code))
         # NVN2's task and mesh stages follow, at +0x40 and +0x48 of the program (Ocarina of Time's foliage and models: Shader/Foliage*.bfsha, Model*.bfsha, drawn by DrawMeshTasksIndirect). An older BNSH's
         # program ends before them, so only a pointer to a control section of that stage counts
         for off, st, stage in ((0x40, 'ts', 6), (0x48, 'ms', 7)):
@@ -179,8 +209,8 @@ def bnsh_shaders(d, base, label):
             out.append((f'{label}#BNSH@{base:#x}#var{v}', st, ctl, code))
     return out
 
-def nvn2_stage(ctl, code):   # an NVN2 shader's stage: compute, task and mesh by the control section's stage byte (+0x56: 5, 6, 7; a task or mesh shader's SPH reads as vertex or domain), else the SPH at the code area's start (no code header)
-    if len(ctl) > 0x56 and ctl[0x56] in (5, 6, 7): return {5: 'cs', 6: 'ts', 7: 'ms'}[ctl[0x56]]
+def nvn2_stage(ctl, code):   # compute, task, mesh and RT use the control's stage byte (+0x56: 5..8); graphics uses the SPH at the code area's start
+    if len(ctl) > 0x56 and ctl[0x56] in (5, 6, 7, 8): return {5: 'cs', 6: 'ts', 7: 'ms', 8: 'rt'}[ctl[0x56]]
     return sph_stage(bytes(0x30) + code[:4]) if len(code) >= 4 else None
 
 def shn_shaders(d, label):
@@ -247,9 +277,18 @@ def bahs_shaders(d, label):
     # shader's code, a shader the game never loads, and its SPH came to the translator as an instruction ("Ampere instruction 481 at 0x0"). Each section counts with its own
     # length (ctl_len), not the length an entry gives it, which for such a false entry covers real entries after it
     spans = {(c, c + ctl_len(s[2])) for _, c, s in found}
-    out = [s for a, _, s in found if not any(lo <= a < hi for lo, hi in spans)]
-    bahs_variations(d, label, [o[0] for o in out])
-    return out
+    candidates = [(a, s) for a, _, s in found if not any(lo <= a < hi for lo, hi in spans)]
+    # A validated binary array is authoritative: descriptor-shaped words may also
+    # occur after the control header, inside a record's other payload. Mario Kart
+    # World 1.8.0's DrivePassShaderDefault has one at 0xa1de4, outside its 2,580
+    # record entries, pairing compute control with unrelated vertex code.
+    offsets = {a for a, _ in candidates}
+    array = bahs_binary_records(d, region, offsets)
+    if array is not None:
+        records, end = array
+        offsets.intersection_update(a for a, _ in records)
+        bahs_variations(d, label, offsets, records, end)
+    return [s for a, s in candidates if a in offsets]
 
 def sead_prim_shaders(d, label):
     """sead's primitive drawer for NVN2 (Lib/sead/primitive_renderer/primitive_drawer_nvn2_shader.bin, Donkey Kong Bananza): four u32 offsets (vertex control section,
@@ -315,27 +354,36 @@ def ndve_shaders(d, label):
     return out
 
 BAHS_VAR = {}   # BAHS entry label → the program variation it belongs to (bahs_variations; var_pairs pairs by it)
-def bahs_variations(d, label, entries):
+def bahs_binary_records(d, region, taken):
+    """Validated binary array: (entry-offset/kind records, array end), or None for
+    an unrecognized layout. Used both to identify shaders and pair variations."""
+    if not taken: return
+    arr = min(taken) - 0x18
+    if arr < 0x20: return
+    asz, acnt = struct.unpack_from('<II', d, arr)
+    end = arr + asz
+    strays = max(1, len(taken) // 100)
+    if not acnt or end > region or acnt < len(taken) - strays: return
+    o, recs = arr + 8, []
+    for _ in range(acnt):
+        if o + 0x20 > end: return
+        rs, kind = struct.unpack_from('<II', d, o)
+        if rs < 0x20: return
+        recs.append((o + 0x10, kind)); o += rs
+    # Every candidate is a record's entry, apart from stray scan matches (Donkey
+    # Kong Bananza's agl_common: 1,556 candidates, 1,555 records). Allow one
+    # stray or up to 1 % in larger arrays. A larger disagreement leaves the layout unrecognized.
+    if o != end or len(taken - {a for a, _ in recs}) > strays: return
+    return recs, end
+
+def bahs_variations(d, label, taken, recs, o):
     """The variations of an agl BAHS file's programs, for var_pairs. The table area holds a binary array (u32 byte size, u32 count, then per binary a record: u32 record size, u32 kind
     (0 vertex, 1 fragment, 3 compute), two u32, the 16-byte entry bahs_shaders reads) and right after it a program array (u32 byte size, u32 count, then per program: u32 record size,
     u32 name length, u32 stage mask, u32 index of its first binary, its name, its macros). A program's binaries run from its first index to the next program's; the n-th vertex binary
     and the n-th fragment binary in that range are one variation. Breath of the Wild: 109 of the 543 pairs drawn on a cold start in Zora's Domain came from these files, and none was in
-    shader_pairs.tsv, which paired only BNSH variations. A file whose arrays do not read back (another layout, or an entry bahs_shaders took that no record holds) gives no pairs"""
-    if not entries: return
-    taken = {int(e.rsplit('@', 1)[1], 16) for e in entries}
-    arr = min(taken) - 0x18
-    if arr < 0x20: return
-    asz, acnt = struct.unpack_from('<II', d, arr)
-    if arr + asz + 8 > len(d) or acnt < len(taken) - max(1, len(taken) // 100): return
-    o, recs = arr + 8, []
-    for _ in range(acnt):
-        if o + 0x20 > arr + asz: return
-        rs, kind = struct.unpack_from('<II', d, o)
-        if rs < 0x20: return
-        recs.append((o + 0x10, kind)); o += rs
-    # every entry bahs_shaders took is a record's, but for a stray match of its scan (Donkey Kong Bananza's agl_common: 1,556 taken, 1,555 records): up to 1 % may lie
-    # outside the array; only the records' entries are paired
-    if o != arr + asz or len(taken - {a for a, _ in recs}) > max(1, len(taken) // 100): return
+    shader_pairs.tsv, which paired only BNSH variations. A file whose arrays do not read back gives no pairs"""
+    acnt = len(recs)
+    if o + 8 > len(d): return
     psz, pcnt = struct.unpack_from('<II', d, o)
     if o + psz > len(d) or not pcnt: return
     q, bases = o + 8, []
@@ -961,6 +1009,40 @@ def d11_pack_shaders(path, label, out):
         if not found: found = glslc_shaders(m, lb, need=False)
         out.extend(found)
 
+UBIART_IPK = bytes.fromhex('50ec12ba')
+def ipk_shaders(path, rel, out):
+    """A UbiArt IPK archive (Rayman Legends: Definitive Edition, bundle_nn.ipk, version 7, 26,878 files). Big-endian: magic 0x50EC12BA, version, platform, +0xc base offset (the data start),
+    +0x10 file count; entries from +0x38: u32 offset count, u32 size, u32 compressed size (0: stored), u64 time, u64 offset × count (from the base), u32 + directory, u32 + name, u32 CRC, u32 0.
+    Compressed entries are zlib. The shaders are whole GLSLC outputs in the engine's .fxb effect files (enginedata/shaders/compiled/nx: renderpct, afterfx, font, movie; 5,893 programs);
+    shaders_dev/ holds a development build of the same effects with other keys, which the game does not ask for. Only the .fxb entries are read: the 2.6 GB of .ckd cooked assets hold none"""
+    label = f'/{rel}'
+    with open(path, 'rb') as f:
+        h = f.read(0x38)
+        if len(h) < 0x38: red(f'{label}: {len(h)} bytes, shorter than a UbiArt IPK header (0x38)')
+        ver, _plat, base, n = struct.unpack_from('>IIII', h, 4)
+        if ver != 7: red(f'{label}: UbiArt IPK version {ver} (only version 7 is read)')
+        t = f.read(max(base - 0x38, 0))
+        if base < 0x38 or len(t) != base - 0x38: red(f'{label}: the IPK header puts its data at {base:#x}, outside the file')
+        p = 0
+        for i in range(n):
+            try:
+                noff, size, csize = struct.unpack_from('>III', t, p); p += 20
+                off = struct.unpack_from('>Q', t, p)[0] if noff else 0; p += 8 * noff
+                pl = struct.unpack_from('>I', t, p)[0]; d = t[p + 4:p + 4 + pl].decode('latin1'); p += 4 + pl
+                nl = struct.unpack_from('>I', t, p)[0]; name = d + t[p + 4:p + 4 + nl].decode('latin1'); p += 4 + nl + 8
+            except struct.error: red(f'{label}: entry {i} of {n} runs past the IPK table ({len(t) + 0x38:#x} bytes): not the layout of a version 7 archive')
+            if not name.endswith('.fxb') or '/shaders_dev/' in '/' + name: continue
+            f.seek(base + off); b = f.read(csize or size)
+            if len(b) != (csize or size): red(f'{label}/{name}: the entry at {base + off:#x} runs past the end of the archive')
+            if csize:
+                try: b = zlib.decompress(b)
+                except zlib.error as e: red(f'{label}/{name}: invalid zlib stream ({e})')
+            if len(b) != size: red(f'{label}/{name}: {len(b)} bytes decoded, the entry says {size}')
+            found = []
+            scan_blob(b, f'{label}/{name}', found)
+            if not found: found = glslc_shaders(b, f'{label}/{name}', need=False)
+            out += found
+
 CPK = b'CPK '
 def cpk_jobs(files, parts=64):
     """Every entry of every CRI CPK archive in ranges of about equal length (Bayonetta 2: six in the RomFS root, 9.5 GB, 6,091 files, 12 GB of them CRILAYLA-compressed; its shaders are BNSH
@@ -1272,6 +1354,58 @@ def viper_shader(d, label):
     if not st: red(f'{label}: a shader binary of no known stage (control +0x56 {ctl[0x56] if len(ctl) > 0x56 else None}, code {code[:4].hex()})')
     if why := check(label, st, ctl, code): red(f'{label} ({st}): {why}')
     return [(f'{label}#VIPER', st, ctl, code)]
+
+CIVBSF = b'CIVBSF\0\0'
+
+def civbsf_shaders(d, label):
+    """Firaxis's shader library: +0x20 the shader table, +0x68 its count. Revision 0x1118 (Civilization VI 1.2.19) has 0x48-byte entries; +8 points to four
+    {u64 offset, u32 size, u32 platform} descriptors, platform 3 holding NVBC: an 0x28-byte header, GLSLC output and reflection. Its header's +8 / +0x10 are their lengths;
+    the two saved pointers are unrelated runtime addresses. All 539 records decode as one stage each (488 distinct keys). Revision 0x1218 has 0x50-byte entries;
+    each entry's +8 points to {u64 data offset, u64 size}; +0 may instead point to platform metadata (Sony pragmas), not the shader.
+    The data is {u32 0xff00ff00, code length, control length, flags}, then code and control. Civilization VII 1.5.0.1's
+    ShaderAutoGen_Linux_NVN_FinalRelease.bs has 801 records (481 keys): 357 vertex, 343 pixel, 101 compute. Fifteen controls carry bytes beyond their own +0x20 length,
+    so the enclosing record's lengths delimit them. Other sections describe effects and resources; their stage-pair relation is not established, so these remain single stages."""
+    where = f'{label} CIVBSF'
+    span(d, 0, 0x90, where)
+    version, = field(d, '<I', 8, where)
+    stride = {0x1118: 0x48, 0x1218: 0x50}.get(version)
+    if stride is None: red(f'{where}: unknown revision {version:#x}')
+    size, = field(d, '<I', 0xc, where)
+    if size != len(d): red(f'{where}: file size {size:#x} does not match {len(d):#x} bytes')
+    table, = field(d, '<Q', 0x20, where)
+    count, = field(d, '<I', 0x68, where)
+    if table < 0x90: red(f'{where}: shader table overlaps the header')
+    span(d, table, count * stride, f'{where} shader table')
+    out = []
+    for i in range(count):
+        entry = table + i * stride; source = f'{where} shader {i}'
+        descriptor, = field(d, '<Q', entry + 8, source)
+        if version == 0x1118:
+            span(d, descriptor, 0x40, f'{source} platform descriptors')
+            for platform in range(4):
+                offset, length, kind = field(d, '<QII', descriptor + platform * 16, source)
+                if kind != platform: red(f'{source}: platform descriptor {platform} has kind {kind}')
+                payload = span(d, offset, length, f'{source} platform {platform} data')
+                if platform != 3: continue
+                span(payload, 0, 0x28, f'{source} NVBC')
+                if payload[:8] != b'NVBC\0\0\0\0': red(f'{source}: unknown NVBC tag')
+                nout, nrefl = field(payload, '<QQ', 8, source)
+                if 0x28 + nout + nrefl != length: red(f'{source}: NVBC output and reflection lengths do not match the data size')
+                output = payload[0x28:0x28 + nout]
+                if output[:4] != b'\x91\x68\x86\x19' or glslc_layout(output, 0)[0] != nout: red(f'{source}: invalid NVBC GLSLC output length or tag')
+                out.extend(glslc_shaders(output, f'{label}#CIVBSF@{entry:#x}'))
+            continue
+        offset, length = field(d, '<QQ', descriptor, f'{source} descriptor')
+        payload = span(d, offset, length, f'{source} data')
+        tag, ncode, nctl, _ = field(payload, '<4I', 0, source)
+        if tag != 0xff00ff00: red(f'{source}: unknown data tag {tag:#x}')
+        if 16 + ncode + nctl != length: red(f'{source}: code and control lengths do not match the data size')
+        code, ctl = payload[16:16 + ncode], payload[16 + ncode:]
+        st = glslc_stage(ctl, code)
+        why = check(source, st, ctl, code) if st else 'unknown shader stage'
+        if why: red(f'{source}: {why}')
+        out.append((f'{label}#CIVBSF@{entry:#x}', st, ctl, code))
+    return out
 
 def zip_jobs(files, parts=64):
     """Every member of every zip archive in ranges of about equal length (Portal: the whole game in game.zip, 41,416 members, 4.6 GB inflated, Deflate or stored; its GLSLC outputs are the
@@ -2303,8 +2437,32 @@ def sumo_shaders(d, label):
         out.append(sumo_program(d, h, size, co, ko, cn, kn, f'{label}#NVNSH@{h:#x}', STAGES[stage]))
     return out
 
+KIT = b'kit!'   # kit.MAGIC: KIT index files, and the tag of their jobs
+
+def kit_jobs(files, parts=64):
+    """Unravel TWO's KIT archives (kit.py): read only through their index, in ranges of members, the parts left out of the loose-file scan. Members are named only by hash, so every
+    one is decoded and scanned (scan_blob: Phyre effects)"""
+    import kit
+    kits = []
+    for p, r in files:
+        if not p.lower().endswith('.kit'): continue
+        with open(p, 'rb') as f: head = f.read(4)
+        if head != KIT: continue
+        try: kits.append((p, r, kit.entries(p)))
+        except ValueError as e: red(str(e))
+    jobs, paths = [], set()
+    step = sum(e[3] for _, _, es in kits for e in es) / parts
+    for p, r, es in kits:
+        paths.add(p); paths.update(f'{p}.{e[1]}' for e in es)
+        cur, size = [], 0
+        for e in es:
+            cur.append(e); size += e[3]
+            if size >= step: jobs.append((p, r, (KIT, tuple(cur)))); cur, size = [], 0
+        if cur: jobs.append((p, r, (KIT, tuple(cur))))
+    return jobs, paths
+
 def phyre_shaders(d, label):
-    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2)."""
+    """Phyre's NVN code immediately precedes its control section, unaligned in RYHP effects; loose blobs also prefix their two lengths (FFX/X-2). Unravel TWO also has headerless compute code."""
     out = []
     for m in re.finditer(re.escape(CTL_MAGIC), d):
         c = m.start()
@@ -2312,9 +2470,10 @@ def phyre_shaders(d, label):
         cn = struct.unpack_from('<I', d, c + 0x20)[0]
         kn = struct.unpack_from('<I', d, c + 0x704)[0]
         k = c - kn
-        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d) or d[k:k + 4] != GFX_MAGIC: continue
+        if k < 0 or kn < 0x80 or cn < 0x760 or c + cn > len(d): continue
         ctl, code = d[c:c + cn], d[k:c]
-        st = sph_stage(code)
+        st = glslc_stage(ctl, code)
+        if st == 'cs' and code[:4] != CS_MAGIC and (d[:4] != b'RYHP' or CTL_MAGIC in code): continue
         if st and not check(label, st, ctl, code): out.append((f'{label}#PHYRE@{k:#x}', st, ctl, code))
     return out
 
@@ -2592,6 +2751,7 @@ def ue_legacy_jobs(files, parts=64, mains=()):
     and the update's *_0_P.pak) and version 11 paks without shader code archives (OCTOPATH TRAVELER II: Majesty-Switch.pak, 3.3 GB). The engine mounts them all as one view, and a patch pak
     (name ending in _P.pak) wins over the others for the same path. Only the newest copy of each path is scanned. With IoStore on (Mario & Luigi: Brothership) the cooked packages are the export bundles
     of the containers beside such a pak, the pak holding only the global shader cache of the shaders: those chunks are scanned too, the newest copy of each chunk ID (uepak.mount_order).
+    A v9 pak can supply a global shader cache and shared shader archives together. Only the inline files go to this scan, and a v9 pak can also lead to inline IoStore bundles with an empty index.
     A pak whose index is encrypted (Little Nightmares II: Helios-Switch.pak, version 8, every entry encrypted too) is opened with the AES key from mains, the ExeFS main of every version
     (uepak.Keys), and its jobs carry the key: (UE_LEGACY, names, key). An encrypted container (DRAGON BALL Sparking! ZERO: every pakchunk*-Switch.utoc, the index of the pak beside each
     encrypted too) is read with the key that opens that pak, else the first key found, and its jobs carry it: (UE_IO, chunks, key).
@@ -2609,7 +2769,8 @@ def ue_legacy_jobs(files, parts=64, mains=()):
     for p, r in sorted(paks, key=lambda x: (x[1].endswith('_P.pak'), x[1])):   # patch paks last, so they replace; one view per pak folder (one per version given)
         try:   # all of a pak's names or none: a patch pak read halfway would still replace the base pak's files
             keys[p] = key_of(p); pk = uepak.Pak(p, keys[p])
-            view.update({(os.path.dirname(p), os.path.normpath(pk.mount + name)): (p, r, name, pk.entry(name)['raw']) for name in pk.files})
+            view.update({(os.path.dirname(p), os.path.normpath(pk.mount + name)): (p, r, name, pk.entry(name)['raw']) for name in pk.files
+                         if pk.version != 9 or not name.endswith('.ushaderbytecode')})   # a mixed v9 pak's archives go through uepak.job
         except (OSError, ValueError) as e: print(f'[RED] /{r}: the pak cannot be read ({e}); its shaders are left out', flush=True)
     chunks, taken, folders = {}, {p for p, _ in paks}, {os.path.dirname(p) for p, _ in paks}
     for p, r in sorted(((p, r) for p, r in files if p.endswith('.utoc') and os.path.dirname(p) in folders), key=lambda x: uepak.mount_order(x[0])):
@@ -3164,6 +3325,7 @@ NEST = 16   # archives in archives scan_blob opens (SARC, PlatinumGames' DAT): r
 def scan_blob(d, label, out, depth=0, left=None):
     if depth > NEST: red(f'{label}: archives nested more than {NEST} deep')
     if d[:4] == b'SHN!': out.extend(shn_shaders(d, label)); return
+    if d[:8] == CIVBSF: out.extend(civbsf_shaders(d, label)); return
     if d[:8] == SUMO_MUX:
         members = list(sumo_members(d, label))
         if left is None: left = [NEST * sum(len(member) for _, member in members)] * 2   # as with Yaz0, count decoded bytes, not compressed bytes
@@ -3215,6 +3377,8 @@ def scan_blob(d, label, out, depth=0, left=None):
     if d[:4] in PG_STAGES and len(d) >= 0x18 and d[(o := struct.unpack_from('<I', d, 0xc)[0]):o + 4] == CTL_MAGIC: out.extend(pg_shader(d, label)); return
     if shaders := pg_sized_shader(d, label): out.extend(shaders); return
     if (shaders := viper_shader(d, label)) is not None: out.extend(shaders); return   # Star Fox's shader binaries
+    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
+        if shaders := phyre_shaders(d, label): out.extend(shaders); return
     if d[:4] == b'VIPR':   # Star Fox's resource containers: two of them wrap the engine's NDSR upscaler networks (ounce-nvn2-upper_left_ndsr.bin), 40 shaders each, as a file inside
         for m in re.finditer(b'NDSR', d):
             if m.start() + 0x20 <= len(d) and d[m.start() + 4:m.start() + 6] == b'\x00\x01': out.extend(ndsr_shaders(d[m.start():], f'{label}#NDSR@{m.start():#x}'))
@@ -3263,7 +3427,7 @@ def pixel_input_cover(shaders):
         k = min(ins, key=lambda k: (-len(ins[k] & left), k)); cover.append(k); left -= ins[k]
     return cover
 
-SINGLE_STAGE = ('#GLSLC@', '#VIPER', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#D3@', '#SHAD@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
+SINGLE_STAGE = ('#GLSLC@', '#VIPER', '#CIVBSF@', '#UE', '#MTSPK@', '#MGFX@', '#NLG', '#PGSO', '#RAW@', '#TFXO@', '#NEEDLE@', '#SNOWDROP@', '#PHYRE@', '#SUMO@', '#NVNSH@', '#D3@', '#SHAD@')   # sources whose every shader is a program of one stage: GLSLC outputs, Unreal's shader records, MT Framework's shader package (BNSH variations, Unity programs, MSHD and SDF pair theirs);
 # Unreal Engine 3's shader caches (ue3_shaders, '#UE3@'); MonoGame's effects, whose passes may name no vertex shader and keep the one bound (Celeste: 10 of its 13 effects draw through SpriteBatch's vertex shader, which is in main); Next Level Games'
 # archives (Luigi's Mansion 3 makes 5,317 programs of one stage each at boot); PlatinumGames' shader objects (Bayonetta 3: one stage each, pg_shader); control sections loose in main
 # (Advance Wars 1+2: Re-Boot Camp's Bink shaders, raw_shaders), which no file pairs; YEBIS's effect file (tfxo_shaders); and Sumo's Ninty_NX descriptors and NVNsh records, one stage
@@ -3281,23 +3445,26 @@ def separable_pairs(keys):
 
 SMASH_ARC = struct.pack('<Q', 0xABCDEF9876543210)   # smash_arc.MAGIC (scan_file reads only the first bytes, without importing the reader)
 BND2 = b'bnd2'
+BND2_LAYOUTS = {2: (3, 0x40), 3: (4, 0x50)}   # version → (blocks per resource, entry size): 2 in Burnout Paradise Remastered, 3 in Need for Speed: Hot Pursuit Remastered
 
 def bnd2_resources(d, label):
-    """The resources of a Criterion Bundle 2 ('bnd2', Burnout Paradise's format; version 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
-    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 four block data offsets (u32), +0x28 flags (bit 0: resources zlib-compressed).
-    An entry is 0x50 bytes: +0x00 resource ID u64, +0x08 import hash u64, +0x10 four uncompressed sizes, +0x20 four sizes on disk (each with the alignment in the top
-    nibble), +0x30 four offsets (from that block's data offset), +0x40 import offset, +0x44 type ID, +0x48 import count u16, flags u8, stream index u8.
-    A resource has up to four blocks (0: main memory, 1: graphics memory). Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
-    ver, _, _, cnt, eoff, *datoff, flags = field(d, '<10I', 4, f'{label}: bnd2 header')
-    table_end = eoff + cnt * 0x50
-    if ver not in (2, 3) or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
+    """The resources of a Criterion Bundle 2 ('bnd2'; version 2 in Burnout Paradise Remastered, 3 in Need for Speed: Hot Pursuit Remastered): → [(resource ID, type, block, data)].
+    The version sets the number of blocks a resource has, B (BND2_LAYOUTS: 3 or 4), and every offset after the first array follows from it.
+    Header: +0x04 version, +0x08 platform, +0x10 entry count, +0x14 entry table offset, +0x18 B block data offsets (u32), then the flags (bit 0: resources zlib-compressed).
+    An entry (0x40 bytes in v2, 0x50 in v3): +0x00 resource ID u64, +0x08 import hash u64, +0x10 B uncompressed sizes, then B sizes on disk (each with the alignment in the top
+    nibble), then B offsets (from that block's data offset), then import offset, type ID, import count u16, flags u8, stream index u8.
+    Block 0 is main memory, block 1 graphics memory. Hot Pursuit Remastered's SHADERS.BNDL keeps one whole GLSLC output in block 1 of each type 0x8 resource (2,112)"""
+    ver, _, _, cnt, eoff = field(d, '<5I', 4, f'{label}: bnd2 header')
+    blocks, entry = BND2_LAYOUTS.get(ver, (0, 0))
+    table_end = eoff + cnt * entry
+    if not blocks or eoff < 0x30 or table_end > len(d): red(f'{label}: bnd2 version {ver} with {cnt} entries at {eoff:#x} is not a layout this reader knows')
+    *datoff, flags = field(d, f'<{blocks + 1}I', 0x18, f'{label}: bnd2 header')
     out = []
     for i in range(cnt):
-        e = eoff + i * 0x50
-        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x44)
-        unpacked = struct.unpack_from('<4I', d, e + 0x10)
-        sizes = struct.unpack_from('<4I', d, e + 0x20); offs = struct.unpack_from('<4I', d, e + 0x30)
-        for k in range(4):
+        e = eoff + i * entry
+        rid, = struct.unpack_from('<Q', d, e); typ, = struct.unpack_from('<I', d, e + 0x14 + 12 * blocks)
+        unpacked, sizes, offs = (struct.unpack_from(f'<{blocks}I', d, e + 0x10 + 4 * blocks * a) for a in range(3))
+        for k in range(blocks):
             n = sizes[k] & 0x0FFFFFFF; expected = unpacked[k] & 0x0FFFFFFF
             where = f'{label}: bnd2 resource {rid:016x} block {k}'
             if not n:
@@ -3431,6 +3598,13 @@ def scan_file_in(args):
         if args[2][1] is None: red(args[2][2])
         lspk_shaders(args[2][1], rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
+    if len(args) > 2 and args[2][0] == KIT:   # a range of a KIT archive's members (kit_jobs)
+        import kit
+        for e in args[2][1]:
+            try: d = kit.read(path, e)
+            except ValueError as err: red(str(err))
+            scan_blob(d, f'/{rel}#{e[0]}', found)
+        return rel, uniq_keys(found), var_pairs(found), trees
     if len(args) > 2 and args[2][0] == b'ARH':
         arh_shaders(path, rel, args[2][1], found)
         return rel, uniq_keys(found), var_pairs(found), trees
@@ -3439,6 +3613,9 @@ def scan_file_in(args):
         return rel, uniq_keys(found), var_pairs(found), trees
     if path.endswith('.pkdswitch') and os.path.exists(path[:-len('.pkdswitch')] + '.pkiswitch'):   # Double Eleven's resource pack, read through its index (d11_pack_shaders)
         d11_pack_shaders(path, '/' + rel, found)
+        return rel, uniq_keys(found), var_pairs(found), trees
+    if head[:4] == UBIART_IPK:   # a UbiArt IPK archive (ipk_shaders): its .fxb effect files, without reading the rest
+        ipk_shaders(path, rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:8] in (IDRK, PDRK):
         idrk_shaders(path, '/' + rel, found)
@@ -3491,7 +3668,7 @@ def scan_file_in(args):
     if len(args) > 2:   # a range of LINKDATA entries (linkdata_jobs)
         linkdata_shaders(path, rel, args[2], found)
         return rel, uniq_keys(found), var_pairs(found), trees
-    if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL): GLSLC outputs in its zlib resources (bnd2_shaders)
+    if head[:4] == BND2:   # a Criterion Bundle 2 (Need for Speed: Hot Pursuit Remastered's SHADERS.BNDL, Burnout Paradise Remastered's bundles): GLSLC outputs in its zlib resources (bnd2_shaders)
         found += bnd2_shaders(open(path, 'rb').read(), '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:3] == b'PAK':   # a Heaps PAK archive (Dead Cells): only its shader cache is read, not its 2 GB of other files (heaps_pak_files, heaps_shaders)
@@ -3536,20 +3713,16 @@ def scan_file_in(args):
     if head[:4] == ZSTD_MAGIC: d = unzs(path)   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
     else:
         with open(path, 'rb') as f: d = f.read()
-    if d[:4] == b'SHN!':
-        found += shn_shaders(d, '/' + rel)
+    if d[:4] == b'SHN!' or d[:8] == CIVBSF:
+        scan_blob(d, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if d[:3] == b'\x1f\x8b\x08':   # standard gzip: Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs
         d = ungzip(d, '/' + rel); head = d[:16]   # later format probes inspect decoded bytes, not the gzip timestamp
     if head[4:5] == b'\x78' and path.endswith('.gz') and (z := gust_gz(d)) is not None: d = z   # Gust's chunked zlib (gust_gz)
-    # Monolith also ships these containers loose, without an ARH/ARD archive
-    # (Xenoblade DE). The generic prefilter below otherwise drops even HCPS.
-    # DRSM model streams contain several embedded XBC1 resources.
-    if d[:4] in (b'HCPS', b'xbc1', b'DRSM') or d[:8] == b'cmp\0zlib':
+    # Containers the generic prefilter below would drop, read whole by scan_blob: Monolith's, which it also ships loose, without an ARH/ARD archive (Xenoblade DE;
+    # DRSM model streams contain several embedded XBC1 resources), and Phyre's effects and FFX/X-2's loose programs, their two lengths before the code (phyre_shaders)
+    if d[:4] in (b'HCPS', b'xbc1', b'DRSM', b'RYHP') or d[:8] == b'cmp\0zlib' or d[8:12] == GFX_MAGIC:
         scan_blob(d, '/' + rel, found)
-        return rel, uniq_keys(found), var_pairs(found), trees
-    if d[:4] == b'RYHP' or d[8:12] == GFX_MAGIC:
-        found += phyre_shaders(d, '/' + rel)
         return rel, uniq_keys(found), var_pairs(found), trees
     if head[:4] != ZSTD_MAGIC and head[4:8] in (ZSTD_MAGIC, LZ4_FRAME_MAGIC): d = unsized(d, '/' + rel)   # HAL's .cmp containers (Kirby and the Forgotten Land: 7,201 of them, 5,121 zstd frames with 19,364 BNSH inside and 2,080 LZ4 frames). Read raw, the split found 121 shaders and the game asked for 900 it did not have ("[RED] shader ... is not in the shader map")
     if d[:4] == b'Yaz0': d = yaz0(d, '/' + rel)
@@ -3642,7 +3815,7 @@ def main():
         names = sorted(f for f in os.listdir(ued) if f.endswith('.ushaderbytecode') and not f.startswith('._')) if os.path.isdir(ued) else []   # AppleDouble metadata, not decoded shader archives
         if not names and uepak.unreal_paks(romfs, inline=False, mains=[mainnso]): red(f'the RomFS has Unreal paks, but there are no decoded shader code archives in {ued} (the NSP script writes them)')
         for nm in names: found += ue_shaders(open(os.path.join(ued, nm), 'rb').read(), f'/ue_shaders/{nm}')
-        results.append(('main', {skey(c, k): (w, s, c, k) for w, s, c, k in found}, var_pairs(found), {}))
+        results.append(('main', uniq_keys(found), var_pairs(found), {}))
     for romfs in dlc_v:
         name = os.path.basename(os.path.normpath(romfs))
         tag = 'aoc/' + (name.removesuffix('.img') if is_image(romfs) else name)
@@ -3667,8 +3840,9 @@ def main():
     pd_jobs, pdats = pdat_jobs(files)   # Kirby Air Riders' PDAT archives: the PMAP records in byte ranges
     rp_jobs, rpfs = rpf_jobs(files, main_v)   # Red Dead Redemption's RPF6 archives, their tables decrypted with the key in main (rpf6.py)
     ls_jobs, lsps = lspk_jobs(files)   # Larian's packages: indexed BSHD programs, without reading unrelated assets
-    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + d3_jobs + ca_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + rp_jobs + ls_jobs
-    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in d3s and p not in cascs and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in rpfs and p not in lsps]
+    kt_jobs, kits = kit_jobs(files)   # Unravel TWO's KIT shards: chained LZ4 resources and Phyre effects
+    big += pak_jobs + tr_jobs + ue_jobs + bd_jobs + arc_jobs + pz_jobs + ck_jobs + d3_jobs + ca_jobs + cr_jobs + zp_jobs + ah_jobs + fb_jobs + pd_jobs + rp_jobs + ls_jobs + kt_jobs
+    files = [(p, r) for p, r in files if not linkdata_jobs(p, r) and p not in paks and p not in trp and p not in uep and p not in bdts and p not in arcs and p not in pkzs and p not in cpks and p not in d3s and p not in cascs and p not in cras and p not in zips and p not in arhs and p not in fbs and p not in pdats and p not in rpfs and p not in lsps and p not in kits]
     with cf.ProcessPoolExecutor(J, initializer=_pool_init, initargs=(common, {}, zdicts)) as ex:
         n = len(big) + len(files)
         results += pooled(ex, big, n) + pooled(ex, files, n, len(big), chunk=16)
