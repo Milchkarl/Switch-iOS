@@ -5,8 +5,6 @@
 name: issue-areas
 
 on:
-  issues:
-    types: [opened, reopened, edited]
   workflow_dispatch:
 
 permissions:
