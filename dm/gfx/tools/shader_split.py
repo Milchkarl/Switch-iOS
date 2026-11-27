@@ -72,6 +72,7 @@
 #   map rows have the same columns as D2R's shader_map.tsv (column 5 names the source chosen for the key); the answer table has one row per compute shader {"local", "shared"} (shared memory rounded up to 16 bytes, as D2R did).
 # Usage: shader_split.py <RomFS dir> <ExeFS main> <output package dir> <output map> <output answer table> [<output pair table> (geo_pairs.tsv and mesh_pairs.tsv are written beside it) [<output pipeline pair table (pso_pairs.tsv)> [<DLC RomFS dirs, comma-separated> [<play capture file list, JSON>]]]]   Environment J=concurrency (default 8)
 #   With an update: give RomFS and main as comma-separated lists (base game first, e.g. data/v0/RomFS,data/v327680/RomFS); the output is the union of both versions (see main())
+#   Prefix the arguments with --json-paths to pass the RomFS, main and DLC path lists as JSON arrays, including paths that contain commas.
 #   Unity type trees need Unity's common string table, which is taken from the first main
 # Pair table: (vertex key, pixel key) of every BNSH variation (every Unity program); dmsh_build uses it to give vertex shaders the outputs their pixel shaders read but they do not write (see dmsh_build.py vs_pad)
 import base64, collections, concurrent.futures as cf, functools, glob, hashlib, json, lzma, os, re, struct, subprocess, sys, time, zlib
@@ -353,6 +354,9 @@ def nxsh_embedded(d, label):
     return out
 
 def bahs_shaders(d, label):
+    # agl's .sharcfb shares the BAHS magic, but holds reflection and fallback data without NVN control sections.
+    if label.endswith('.sharcfb') and len(d) >= 0x20 and struct.unpack_from('<I', d, 8)[0] == len(d) and CTL_MAGIC not in d:
+        return []
     rsz, region = field(d, '<II', 0x18, f'{label} BAHS header')
     if region + rsz > len(d): red(f'{label} BAHS code region out of bounds')
     found = []
@@ -1288,21 +1292,34 @@ def rgxd_shaders(d, label):
     return out
 
 def d11_pack_shaders(path, label, out):
-    """Double Eleven's resource pack (Red Dead Redemption's d11extra/langselect.pkdswitch, the language selection shown before the game): the data file holds the members one after another, its
-    index beside it (.pkiswitch) is u32 version 3, u32 0, u32 member count (22), then per member {u32 length, u32 stored length, u32 offset in the data file, u32 name hash}; a member whose stored
-    length differs from its length is one zlib stream. Members 4 and 5 are whole GLSLC outputs, the screen's pixel and vertex shader (98664fb56b9c9fdf, 70d4dd8068044bb5): without them the host
-    found no vertex shader for the first program the game draws with. The others are textures ('DFvN') and fonts ('BMF')"""
+    """Double Eleven's resource pack (Red Dead Redemption's d11extra/langselect.pkdswitch, LEGO Harry Potter Collection's launcher_dll/launcher.pkdswitch): the data file holds the members one
+    after another, its index beside it (.pkiswitch) is u32 version 3, u32 0, u32 member count, then per member {u32 length, u32 stored length, u32 offset in the data file, u32 name hash}.
+    Stored length 0 marks an uncompressed (raw) member of `length` bytes at `offset` (LEGO Harry Potter's member 90 of 158: length 8, stored 0, off 0x885b87, member 91 at 0x885b8f); a non-zero
+    stored length differing from `length` is one zlib stream. Every member's decoded or raw bytes are scanned for shaders (whole GLSLC outputs in langselect members 4 and 5 and launcher
+    members 68, 69, 77 and 78; the other members are textures ('DFvN'), fonts ('BMF') and metadata)"""
     with open(path[:-len('.pkdswitch')] + '.pkiswitch', 'rb') as f: idx = f.read()
     with open(path, 'rb') as f: d = f.read()
     if len(idx) < 12: red(f'{label}: the pack index is cut short ({len(idx)} bytes)')
     ver, _, n = struct.unpack_from('<3I', idx)
     if ver != 3: red(f'{label}: pack index version {ver}: only 3 is known')
     if 12 + 16 * n > len(idx): red(f'{label}: the pack index lists {n} members but holds {(len(idx) - 12) // 16}')
-    for k in range(n):
-        size, stored, off, h = struct.unpack_from('<4I', idx, 12 + 16 * k)
-        if off + stored > len(d): red(f'{label}: member {k} runs past the end of the data file')
-        m = d[off:off + stored]
-        if stored != size:
+    ents = [struct.unpack_from('<4I', idx, 12 + 16 * k) for k in range(n)]
+    seen = {}
+    for k, (size, stored, off, h) in enumerate(ents):
+        if stored or size: seen.setdefault((off, size, stored), (k, h))
+    spans = sorted((off, off + (stored or size), size, stored, k, h) for (off, size, stored), (k, h) in seen.items())
+    end, end_k = -1, -1
+    for i, (off, stop, size, stored, k, h) in enumerate(spans):
+        if not stored:
+            if off < end: red(f'{label}: member {k} ({h:08x}) at {off:#x} overlaps member {end_k} ending at {end:#x}')
+            if i + 1 < len(spans) and stop > spans[i + 1][0]:
+                red(f'{label}: member {k} ({h:08x}) has stored length 0 and length {size}, overlapping member {spans[i + 1][4]} at {spans[i + 1][0]:#x}')
+        if stop > end: end, end_k = stop, k
+    for k, (size, stored, off, h) in enumerate(ents):
+        nbytes = stored or size
+        if off + nbytes > len(d): red(f'{label}: member {k} runs past the end of the data file')
+        m = d[off:off + nbytes]
+        if stored and stored != size:
             try: m = zlib.decompress(m)
             except zlib.error as e: red(f'{label}: member {k} ({h:08x}) is no zlib stream: {e}')
             if len(m) != size: red(f'{label}: member {k} ({h:08x}) inflates to {len(m)} bytes, the index says {size}')
@@ -1678,8 +1695,12 @@ def cra_shaders(path, rel, ents, out):
     import cra
     with open(path, 'rb') as f:
         for e in ents:
-            if cra.head(f, e)[:4] in (b'FSTM', b'\x1aE\xdf\xa3'): continue
-            scan_blob(cra.undo(cra.read(f, e)), f'/{rel}/{e[1]}', out)
+            where = f'/{rel}/{e[1]}'
+            try:
+                if cra.head(f, e)[:4] in (b'FSTM', b'\x1aE\xdf\xa3'): continue
+                d = cra.undo(cra.read(f, e))
+            except cra.Error as x: red(f'{where}: {x}')
+            scan_blob(d, where, out)
 
 PDAT, PDAT_PMAP = b'PDAT', b'PMAP'
 PDAT_ZSTD, PDAT_CTL, PDAT_SPAN = b'\x28\xb5\x2f\xfd', CTL_MAGIC + b'\xc9\0\0\0', 1 << 20   # a PMAP frame never takes up 1 MB (the largest of Kirby Air Riders' 27,299: 186 KB inflated); pdat_shaders stops if one does
@@ -4154,12 +4175,32 @@ def ungzip(d, label):
     return out
 
 
+YAZ0_RUNS = tuple((len(r[0]), tuple(map(len, r[1:]))) for r in (format(h, '08b').split('0') for h in range(256)))   # a group header's literal runs: before its first back-reference, and after each one
+YAZ0_REF = tuple((b >> 4 and (b >> 4) + 2, ((b & 15) << 8) + 1) for b in range(256))   # a back-reference's first byte: its length (0: one more byte + 0x12) and its distance less the second byte
+
+
 def yaz0(s, label='Yaz0'):
-    """Yaz0 decompression (Super Mario 3D World + Bowser's Fury: almost all of RomFS is .szs = SARC wrapped in Yaz0). Pure Python runs at about 20–45 MB/s per core, under a minute for the whole 4.7 GB RomFS in parallel, and needs no extra dependency.
-    Group header bits: 1 = one literal byte; 0 = back-reference, 2 bytes {length high nibble, 12-bit distance} (distance + 1); length 0 reads one more byte + 0x12, else + 2. Overlapping copies are expanded by their period"""
-    n = int.from_bytes(s[4:8], 'big'); out = bytearray(); si = 16
+    """Yaz0 decompression (Super Mario 3D World + Bowser's Fury: almost all of RomFS is .szs = SARC wrapped in Yaz0; Breath of the Wild's base RomFS: 31,304 Yaz0 files, 15.7 GB decoded). Pure Python, needs no extra dependency.
+    Group header bits: 1 = one literal byte; 0 = back-reference, 2 bytes {length high nibble, 12-bit distance} (distance + 1); length 0 reads one more byte + 0x12, else + 2. Overlapping copies are expanded by their period.
+    Whole groups go in batches: past the first 0x1000 bytes (no distance reaches before the start), g groups that can neither read past the stream (a group reads at most 1 + 8 * 3 bytes) nor pass n
+    (it writes at most 8 * 0x111), each literal run one slice (YAZ0_RUNS). The rest, the start, the end and a damaged stream, goes item by item, with the same output and errors.
+    About 70 MB/s per core on Breath of the Wild's files, twice the item-by-item loop (M5 Pro, Python 3.13; 79% of their items are literals, 31% of their headers 0xff)"""
+    n = int.from_bytes(s[4:8], 'big'); out = bytearray(); si = 16; slen = len(s)
     try:
         while len(out) < n:
+            o = len(out)
+            if o >= 0x1000 and (g := min((slen - si) // 25, (n - o) // 0x888)) > 0:
+                for _ in range(g):
+                    k, rest = YAZ0_RUNS[s[si]]; si += 1
+                    if k: out += s[si:si + k]; si += k; o += k
+                    for k in rest:
+                        ln, dist = YAZ0_REF[s[si]]; dist += s[si + 1]
+                        if ln: si += 2
+                        else: ln = s[si + 2] + 0x12; si += 3
+                        st = o - dist; o += ln
+                        out += out[st:st + ln] if dist >= ln else (out[st:] * (ln // dist + 1))[:ln]
+                        if k: out += s[si:si + k]; si += k; o += k
+                continue
             h = s[si]; si += 1
             for _ in range(8):
                 if h & 0x80:
@@ -4180,12 +4221,17 @@ def yaz0(s, label='Yaz0'):
 def sarc_members(d, label='SARC'):
     """(name, bytes) of each member of a SARC: the header, SFAT (its entries), SFNT (the names), then the data, where every member lies. A member range outside the data
     (one spanning the whole archive would be scanned as the archive again, without end) is a damaged archive"""
-    hl, bom, size, doff = field(d, '<HHII', 4, f'{label} SARC header')
-    n = field(d, '<H', hl + 6, f'{label} SFAT header')[0]
+    bom = d[6:8]
+    if bom == b'\xff\xfe': order = '<'
+    elif bom == b'\xfe\xff': order = '>'
+    else: red(f'{label}: invalid SARC byte-order mark {bom.hex()}')
+    hl, _, _, doff = field(d, order + 'HHII', 4, f'{label} SARC header')
+    n = field(d, order + 'H', hl + 6, f'{label} SFAT header')[0]
     names = hl + 12 + 16 * n + 8
     if not names <= doff <= len(d): red(f'{label}: SARC data at {doff:#x}, its {n} entries and the names end at {names:#x}, the archive at {len(d):#x}')
+    entry = struct.Struct(order + 'IIII')
     for i in range(n):
-        h, attr, s, e = struct.unpack_from('<IIII', d, hl + 12 + 16 * i)
+        _, attr, s, e = entry.unpack_from(d, hl + 12 + entry.size * i)
         if not s <= e <= len(d) - doff: red(f'{label}: SARC member {i} at {s:#x}..{e:#x} of the data lies outside its {len(d) - doff:#x} bytes')
         if attr >> 24:   # up to the name's own NUL: splitting the rest of the archive per member was quadratic (Fire Emblem Fortune's Weave's Layout/Common.arc.zst: 6 minutes)
             o = names + (attr & 0xffffff) * 4; z = d.find(b'\0', o)
@@ -4253,6 +4299,22 @@ def nested_zstd(d, label, limit):
         if not dec.eof: red(f'{label}: incomplete or trailing data in a nested zstd frame')
         parts.append(chunk); rem -= len(chunk); view = dec.unused_data
     return parts[0] if len(parts) == 1 else b''.join(parts)
+
+EMZ = b'#EMZ'
+
+
+def emz_decode(d, label, limit):
+    """Decode the raw Deflate stream in an EMZ wrapper, within the archive budget."""
+    size, start = field(d, '<II', 8, f'{label} EMZ header')
+    if not 16 <= start < len(d): red(f'{label}: invalid EMZ stream offset {start:#x}')
+    if size > limit: red(f'{label}: EMZ expands beyond the archive byte budget')
+    stream = zlib.decompressobj(-zlib.MAX_WBITS)
+    try: decoded = stream.decompress(d[start:], size + 1)
+    except zlib.error as e: red(f'{label}: invalid EMZ Deflate stream ({e})')
+    if len(decoded) != size or not stream.eof or stream.unused_data:
+        red(f'{label}: EMZ stream does not end at its declared size ({size} bytes)')
+    return decoded
+
 
 def frame_size(f):
     """The uncompressed size a zstd or LZ4 frame header records, None when it records none"""
@@ -4570,7 +4632,7 @@ def scan_blob(d, label, out, depth=0, left=None):
         return
     for m in re.finditer(b'SLCT\x03\x10\0\0', d): out.extend(slct_shaders(d, m.start(), label))
     stored = len(d)   # what the member takes up in its archive
-    compressed = d[:4] in (b'Yaz0', ZSTD_MAGIC)
+    compressed = d[:4] in (b'Yaz0', ZSTD_MAGIC, EMZ)
     if d[:4] == b'Yaz0':
         if left is not None:   # charged by its header before it is decoded
             left[1][0] -= int.from_bytes(d[4:8], 'big')
@@ -4578,6 +4640,9 @@ def scan_blob(d, label, out, depth=0, left=None):
         d = yaz0(d, label)
     elif d[:4] == ZSTD_MAGIC:
         d = nested_zstd(d, label, left[1][0] if left is not None else max(16 << 20, 256 * stored))
+        if left is not None: left[1][0] -= len(d)
+    elif d[:4] == EMZ:
+        d = emz_decode(d, label, left[1][0] if left is not None else max(16 << 20, 256 * stored))
         if left is not None: left[1][0] -= len(d)
     if left is None: n = NEST * len(d); left = ([n], [n])   # the file itself: traversal bytes and compressed-member expansion
     else:
@@ -5246,7 +5311,7 @@ def scan_file_in(args):
     if head[:4] == ZSTD_MAGIC: d = unzs(path)   # by the magic: Paper Mario: The Thousand-Year Door names its zstd files .zst (8,726, its shaders among them)
     else:
         with open(path, 'rb') as f: d = f.read()
-    if d[:4] == b'SHN!' or d[:8] == CIVBSF:
+    if d[:4] in (b'SHN!', EMZ) or d[:8] == CIVBSF:
         scan_blob(d, '/' + rel, found)
         return rel, uniq_keys(found), var_pairs(found), trees
     if d[:3] == b'\x1f\x8b\x08':   # standard gzip: Skyward Sword HD's Shaders.arc.gz wraps paired GLSLC outputs
@@ -5417,13 +5482,22 @@ def plan_jobs(files, heads, romfs_v, main_v):
 
 
 def main():
-    romfs_l, main_l, pkg, mapout, factsout = sys.argv[1:6]
-    pairsout = sys.argv[6] if len(sys.argv) > 6 else None
-    psopairsout = sys.argv[7] if len(sys.argv) > 7 else None   # pso_pairs.tsv: supplemental BAHS program variations and legacy Unity pass-input covers
-    dlc_v = sys.argv[8].split(',') if len(sys.argv) > 8 and sys.argv[8] else []   # extra content has no ExeFS; each root is the extracted DLC index
-    # Several versions (base game + update): the RomFS and main arguments are comma-separated and paired one to one; the output is their union (keys are content hashes, shaders shared by versions appear once).
+    args = sys.argv[1:]
+    json_paths = args[:1] == ['--json-paths']
+    if json_paths:
+        args = args[1:]
+    romfs_l, main_l, pkg, mapout, factsout = args[:5]
+    pairsout = args[5] if len(args) > 5 else None
+    psopairsout = args[6] if len(args) > 6 else None   # pso_pairs.tsv: supplemental BAHS program variations and legacy Unity pass-input covers
+    dlc_l = args[7] if len(args) > 7 else ''
+    if json_paths:
+        romfs_v, main_v = json.loads(romfs_l), json.loads(main_l)
+        dlc_v = json.loads(dlc_l) if dlc_l else []
+    else:
+        romfs_v, main_v = romfs_l.split(','), main_l.split(',')
+        dlc_v = dlc_l.split(',') if dlc_l else []
+    # The RomFS and main lists pair one to one; the output is their union (keys are content hashes, shaders shared by versions appear once).
     # The first version's source column is unchanged; later versions are prefixed with their workspace directory name (e.g. v327680): /v327680/Shader/…, main@v327680. They sort after the first version, so existing rows keep their package indices.
-    romfs_v, main_v = romfs_l.split(','), main_l.split(',')
     if len(romfs_v) != len(main_v): red(f'{len(romfs_v)} RomFS and {len(main_v)} main: they must pair one to one')
     registered = read_registered_sources(os.environ.get('DM_SPLIT_REGISTERED_MAP', ''))
     files, results, common = [], [], None
@@ -5491,8 +5565,8 @@ def main():
     bad = [extra for *_, extra in results if isinstance(extra, tuple)]
     if bad: print(f'[RED] {sum(e[2] for e in bad)} file(s) could not be read, their shaders are left out (first: {bad[0][1]})', flush=True)   # build_ipa_from_nsp.py reads this line
     play_pairs = set()
-    if len(sys.argv) > 9:
-        played, play_pairs = glslc_play(sys.argv[9])
+    if len(args) > 8:
+        played, play_pairs = glslc_play(args[8])
         results.append(('glslc_play', played, set(), {}))   # game files, boot captures and DLC retain ownership of any keys they share with play captures
     keys, pairs, per_src = merge_keys(results, registered)
     pairs.update(pair for pair in play_pairs if any(k in keys and keys[k][0].startswith('/glslc_play/') for k in pair[:3]))

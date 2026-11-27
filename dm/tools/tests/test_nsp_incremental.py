@@ -1,5 +1,6 @@
 """NSP script reuse across derived and provisional builds. Real fingerprints and mock tool runs; no game files, keys or Xcode needed."""
 import collections
+from functools import partial
 import hashlib
 import importlib.util
 import json
@@ -683,9 +684,9 @@ class SplitShaders(Base):
         cm = mock.patch.object(nsp, 'run', self.split); cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
 
     def split(self, cmd, log, env=None, cwd=None, on_line=None):   # shader_split.py: the package and the four tables, deterministic for the same rows
-        self.splits += 1; self.last_cmd = cmd; out = Path(cmd[4]); out.mkdir(parents=True); (out / 'main.bin').write_bytes(self.rows.encode())
-        for n, t in zip(self.NAMES, cmd[5:]): Path(t).write_text(self.table(n))
-        Path(cmd[7]).with_name('geo_pairs.tsv').write_text(self.table('geo_pairs.tsv'))   # written beside shader_pairs.tsv
+        self.splits += 1; self.last_cmd = cmd; out = Path(cmd[5]); out.mkdir(parents=True); (out / 'main.bin').write_bytes(self.rows.encode())
+        for n, t in zip(self.NAMES, cmd[6:]): Path(t).write_text(self.table(n))
+        Path(cmd[8]).with_name('geo_pairs.tsv').write_text(self.table('geo_pairs.tsv'))   # written beside shader_pairs.tsv
         Path(log).write_text(self.log)
 
     def table(self, n):   # tests that set their own tables need not name geo_pairs.tsv
@@ -793,9 +794,9 @@ class SplitShaders(Base):
         dlc = self.tmp / 'work/aoc/7'; dlc.mkdir(parents=True)
         asset = dlc / 'shader.archive'; asset.write_bytes(b'new shader')
         self.go(g, dlc_roms=[dlc]); self.assertEqual(self.splits, 2)
-        self.assertEqual(self.last_cmd[-1], str(dlc))
+        self.assertEqual(json.loads(self.last_cmd[-1]), [str(dlc)])
         # Extra content has no main: the base RomFS/main pairing remains unchanged.
-        self.assertEqual(self.last_cmd[2:4], [str(self.ex / 'RomFS'), str(self.ex / 'ExeFS/main')])
+        self.assertEqual([json.loads(arg) for arg in self.last_cmd[3:5]], [[str(self.ex / 'RomFS')], [str(self.ex / 'ExeFS/main')]])
         self.go(g, dlc_roms=[dlc]); self.assertEqual(self.splits, 2)
         asset.write_bytes(b'updated DLC shader')
         self.go(g, dlc_roms=[dlc]); self.assertEqual(self.splits, 3)
@@ -806,7 +807,7 @@ class SplitShaders(Base):
         folder = self.tmp / 'separate gameplay captures'; folder.mkdir()
         capture = folder / ('a' * 16 + '.glslc'); capture.write_bytes(b'first output')
         self.go(g, glslc_play=[folder]); self.assertEqual(self.splits, 2)
-        self.assertEqual(self.last_cmd[-2], '')   # no DLC paths before the game-independent capture manifest
+        self.assertEqual(json.loads(self.last_cmd[-2]), [])   # no DLC paths before the game-independent capture manifest
         self.go(g, glslc_play=[folder]); self.assertEqual(self.splits, 2)
         capture.write_bytes(b'other output')
         self.go(g, glslc_play=[folder]); self.assertEqual(self.splits, 3)
@@ -1313,8 +1314,10 @@ class LayerShaders(Base):
         logs = self.tmp / 'logs'; logs.mkdir(); runs = []
         def translate(cmd, log, **kw):
             api = Path(cmd[1]).stem.split('_')[0]
-            lib = Path(cmd[-1]) / api / f'{api}_shaders.metallib'
-            lib.parent.mkdir(parents=True); lib.write_bytes(b'library')
+            out = Path(cmd[-1]) / api
+            out.mkdir(parents=True)
+            (out / f'{api}_shaders.metallib').write_bytes(b'library')
+            (out / f'{api}_shaders.tsv').write_text('# table\n')
             Path(log).write_text('macosx: 1\n'); runs.append(api)
         with mock.patch.object(nsp, 'run', side_effect=translate), mock.patch.object(nsp, 'toolchain', return_value=()), \
              mock.patch.object(nsp.shutil, 'which', return_value='/glslangValidator'), \
@@ -1323,7 +1326,7 @@ class LayerShaders(Base):
                 roots = [self.ex / 'RomFS', cap] + ([self.ex / 'ExeFS/main'] if api == 'gl' else [])
                 for own in (False, True):
                     sh = self.tmp / f'{api}-{own}'
-                    def go(): build(sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=own)
+                    go = partial(build, sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=own)
                     go(); go()
                     for p in (self.ex / 'RomFS/a.bin', cap / 'shader.bin'):
                         with self.subTest(api=api, own=own, path=p):
@@ -1344,8 +1347,10 @@ class LayerShaders(Base):
         self.derive(); g = game.Game(self.pdir)
         logs = self.tmp / 'logs'; logs.mkdir(); runs = []
         def translate(cmd, log, **kw):
-            lib = Path(cmd[-1]) / 'gl/gl_shaders.metallib'
-            lib.parent.mkdir(parents=True, exist_ok=True); lib.write_bytes(b'library')
+            out = Path(cmd[-1]) / 'gl'
+            out.mkdir(parents=True, exist_ok=True)
+            (out / 'gl_shaders.metallib').write_bytes(b'library')
+            (out / 'gl_shaders.tsv').write_text('# GL shader ABI 3\n')
             Path(log).write_text('macosx: 1\n'); runs.append(cmd)
         src = self.tmp / 'gl_src'; (src / 'shaders').mkdir(parents=True)
         (src / 'shaders/a.frag').write_text('#version 330\nvoid main() {}\n')
@@ -1360,7 +1365,7 @@ class LayerShaders(Base):
                 with self.subTest(provisional=prov):
                     sh = self.tmp / f'gl-img-{prov}'
                     roots = [nsp.rfs.Path(img), self.ex / 'ExeFS/main']
-                    def go(): nsp.build_gl_shaders(sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=prov)
+                    go = partial(nsp.build_gl_shaders, sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=prov)
                     runs.clear()
                     go(); self.assertEqual(len(runs), 1)
                     go(); self.assertEqual(len(runs), 1)   # untouched image reuses
@@ -1381,6 +1386,59 @@ class LayerShaders(Base):
             nso(self.ex / 'ExeFS/main', BID)
             nsp.build_gl_shaders(sys.executable, REPO, lroots, sh_loose, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False)
             self.assertEqual(len(runs), 3)
+
+    def test_replacing_packed_dlc_equal_length_shader_rebuilds_registered_build(self):
+        import romfs_image
+        self.derive(); g = game.Game(self.pdir)
+        logs = self.tmp / 'logs'; logs.mkdir(); runs = []
+        def translate(cmd, log, **kw):
+            api = Path(cmd[1]).stem.split('_')[0]
+            out = Path(cmd[-1]) / api
+            out.mkdir(parents=True, exist_ok=True)
+            (out / f'{api}_shaders.metallib').write_bytes(b'library')
+            (out / f'{api}_shaders.tsv').write_text('# table\n')
+            Path(log).write_text('macosx: 1\n'); runs.append(cmd)
+        base_src = self.tmp / 'base_romfs'; (base_src / 'shaders').mkdir(parents=True)
+        (base_src / 'shaders/base.frag').write_text('#version 330\nvoid main(){int b=0;}\n')
+        base_img = self.ex / 'RomFS.img'
+        romfs_image.pack(base_src, base_img)
+        with mock.patch.object(nsp, 'run', side_effect=translate), mock.patch.object(nsp, 'toolchain', return_value=()), \
+             mock.patch.object(nsp.shutil, 'which', return_value='/glslangValidator'), \
+             mock.patch.object(nsp.subprocess, 'run', return_value=mock.Mock(stdout='compiler', stderr='')):
+            cases = (
+                ('gl', nsp.build_gl_shaders, 'shaders/dlc.frag', b'#version 330\nvoid main(){int a=1;}\n', b'#version 330\nvoid main(){int b=2;}\n'),
+                ('vk', nsp.build_vk_shaders, 'shaders/dlc.spv', b'\x03\x02\x23\x07AAAA', b'\x03\x02\x23\x07BBBB'),
+            )
+            for api, build, rel, first, second in cases:
+                self.assertEqual(len(first), len(second))
+                with self.subTest(api=api):
+                    dlc_src = self.tmp / f'{api}_dlc_src'; (dlc_src / 'shaders').mkdir(parents=True)
+                    (dlc_src / rel).write_bytes(first)
+                    dlc_img = self.tmp / f'{api}_aoc/1.img'; dlc_img.parent.mkdir(parents=True)
+                    romfs_image.pack(dlc_src, dlc_img)
+                    sh = self.tmp / f'{api}-dlc-img'
+                    roots = [nsp.rfs.Path(base_img), self.ex / 'ExeFS/main']
+                    def go(dlc_list, build=build, roots=roots, sh=sh):
+                        build(sys.executable, REPO, roots, sh, {'WORK': str(self.tmp), 'PATH': ''}, logs, g, mac=True, provisional=False, dlc_roms=dlc_list)
+                    runs.clear()
+                    go([dlc_img]); self.assertEqual(len(runs), 1)
+                    self.assertIn(dlc_img, runs[-1])
+                    go([dlc_img]); self.assertEqual(len(runs), 1)   # unchanged image reuses
+                    (dlc_src / rel).write_bytes(second)
+                    romfs_image.pack(dlc_src, dlc_img)
+                    go([dlc_img]); self.assertEqual(len(runs), 2)   # equal-length replacement rebuilds once
+                    go([dlc_img]); self.assertEqual(len(runs), 2)   # following unchanged run reuses
+                    moved = dlc_img.with_name('2.img'); dlc_img.rename(moved)
+                    go([moved]); self.assertEqual(len(runs), 3)     # DLC index change invalidates even with identical bytes
+                    go([moved]); self.assertEqual(len(runs), 3)
+                    # Loose DLC directory control: equal-length replacement with fresh mtime also rebuilds once
+                    loose_dlc = self.tmp / f'{api}_aoc_loose/1'; (loose_dlc / 'shaders').mkdir(parents=True)
+                    (loose_dlc / rel).write_bytes(first)
+                    go([loose_dlc]); self.assertEqual(len(runs), 4)
+                    go([loose_dlc]); self.assertEqual(len(runs), 4)
+                    (loose_dlc / rel).write_bytes(second); self.redump(loose_dlc / rel)
+                    go([loose_dlc]); self.assertEqual(len(runs), 5)
+                    go([loose_dlc]); self.assertEqual(len(runs), 5)
 
 
 class MacApp(Base):

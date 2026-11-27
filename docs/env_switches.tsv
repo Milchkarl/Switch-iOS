@@ -13,7 +13,7 @@ DM_AUDIO_CAPTURE	test	`=<file>`: `tests/t_audio_live.c` records the output devic
 DM_AUDIO_CAPTURE_CH	test	`=<n>`: the channels `tests/t_audio_live.c` records with `DM_AUDIO_CAPTURE` (6 by default)
 DM_AUDIO_CAPTURE_DEVICE	test	`=<part of a device name>`: `tests/t_audio_live.c` records that device instead of the one playing at start (the target of a switch)
 DM_AUDIO_DEVICE	diagnostic	`=<part of a device name>` (Mac) plays the audio on the output device with that name (a virtual device such as BlackHole 16ch, for tests); the default output otherwise
-DM_AUDIO_DUMP	diagnostic	`=<file>` writes every PCM block the game appends as is (16-bit, 48 kHz, channel count as in the OpenAudioOut log), to judge whether a sound played
+DM_AUDIO_DUMP	diagnostic	`=<file>` writes every PCM block an output accepts (16-bit, 48 kHz, the channel count logged by `DM_AUDIO_DUMP`: the output's own count, or for an `AudioRenderer` DeviceSink its 2-channel stereo fold on silent/stereo routes and 6-channel surround on a 5.1 route), each output to its own file: `<file>` for `audio #0`, `<file>.<N>` for `audio #N`; to judge whether a sound played
 DM_AUDIO_LIVE_PCM	test	`=<file>`: `tests/t_audio_live.c` plays that file (16-bit, 48 kHz, six channels interleaved in the guest's order) instead of its test tones
 DM_AUDIO_MUTE	switch	`=1` runs the real Core Audio output path (callback pacing, background take-over) with the output silenced, for lifecycle tests on the Mac without noise
 DM_AUDREN_RT	diagnostic	`0` keeps ordinary scheduling for the in-process audio renderer so its default real-time policy can be compared against it
@@ -215,12 +215,13 @@ DM_NVN_INDLOG	diagnostic	`=<n>`: the first n indirect draws (and those of pass-d
 DM_NVN_IXCLOG	diagnostic	`=<n>` logs the first n indirect draw and dispatch conversions (record to arguments) once the GPU has run them
 DM_NVN_KEYDUMP	diagnostic	`=<fs key>[:n[:every]]`: for up to n draws of that fragment shader (default 6), logs the pass dump binding lines plus vertex formats, vertex streams and uniform values; meant for devices
 DM_NVN_LAZY_CLEAR	switch	`0` makes clears with no draw after them open a pass of their own, as before; by default they wait to become the load action of the next pass on that target
+DM_NVN_LEVEL_GROUP	switch	`0` keeps a run of one-draw passes into the levels and faces of one cube or array texture in the game's order (face by face); by default it is replayed level by level so each level's faces become one slice-merged pass (`rg_plan`); `ab` alternates with `DM_AB`
 DM_NVN_LINE_WIDTH	switch	`0` draws every NVN line 1 pixel wide, as before; by default a line draw wider than a pixel is drawn as a quad per segment (`nvn_wline.inc`)
 DM_NVN_LOG	diagnostic	`=1` logs the creation of NVN objects
 DM_NVN_MAGSCAN	diagnostic	`=<fs key>[:every[:phase]]`: device self-check that reads each pass's colour attachments every `every` frames (default 30) and logs `[mag]` lines for solid magenta 16×16 blocks or non-finite pixels
 DM_NVN_MDX_PRESCAN	switch	`0` copies an indirect-count multi-draw's records at its own first draw, which splits a render pass an earlier draw opened; by default the draw that opens a pass copies those of the multi-draws after it first (ab with DM_AB)
 DM_NVN_MEM_PRESSURE	switch	Level at which OS memory pressure events (`DISPATCH_SOURCE_TYPE_MEMORYPRESSURE`) trigger a trim (`mem_trim`: waiting recycled render-target heaps, packaged-texture spares, idle uploaded textures, idle upload staging blocks): `0` logs only, `1` trims at warn and critical (default on iOS), `2` trims at critical only (default on macOS)
-DM_NVN_METALWA	switch	`0` / `1`: turns KosmicKrisp's KK3 ballot rewrite (`dm_mwa3_fc`, `DMSH_MWA_FC`) off / on at runtime instead of on below macOS 27 (and on iOS) and off from macOS 27 (where Apple's GPU compiler is fixed)
+DM_NVN_METALWA	switch	`0` / `1`: turns KosmicKrisp's KK3 ballot rewrite (`dm_mwa3_fc`, `DMSH_MWA_FC`) off / on at runtime; off by default (`issue #3405`: enabling KK3 on macOS 26.7.3 / M2 Max corrupted Ocarina of Time), `1` opts in for testing or affected titles
 DM_NVN_MFX_DIRECT	switch	`0` copies the game's colour into MetalFX's RGBA16F input (DM_UPSCALER=metalfx) unless it is RGBA16F; by default an input that is the whole rectangle MetalFX reads is taken in its own format (ab with DM_AB)
 DM_NVN_MISSING_KEYS	path	`=<file>`: appends the key of each shader the library lacks to that file, once per key, for the next `--seen-shaders` build. The Mac launcher sets it to `shader_missing.txt` in the Application Support folder, the partial run command to `run/shader_missing.txt`; unset, nothing is written
 DM_NVN_PARTIAL_UPLOAD	switch	`0` reads a texture whole from its storage at every re-upload; by default a re-upload reads only the images (a layer's level) with a page written since the last upload and copies the others from the texture it replaces
@@ -245,6 +246,7 @@ DM_NVN_RP_AREA	switch	`0` makes passes on targets of 16 M pixels or more cover t
 DM_NVN_RT_CONTINUE	switch	`0` ends the pass whenever the game sets render targets, as before; by default SetRenderTargets naming the open pass's targets continues the pass
 DM_NVN_RT_DEAD	switch	`0` keeps every shared render target of a GPU-only pool while a texture object names it, as before; by default one another target drew over and that has not been used for 3 s is released once a second, and made again at its next use (`ab` alternates it with the `DM_AB` phases)
 DM_NVN_RT_RECYCLE	switch	`0` makes each render target in a GPU-only pool, each feedback snapshot and each resolution family heap its own exact Metal allocation, freed with its texture, as before; by default they are placed in heaps from one free list, and a freed one's heap waits, resident, for the next texture it fits (`ab` alternates it with the `DM_AB` phases)
+DM_NVN_RT_SUBSET	switch	`0` begins a pass of its own for targets that are the first ones of the open pass's, as before; by default the pass goes on with the others attached, unwritten (`rt_prefix`); `ab` alternates it with `DM_AB`
 DM_NVN_RUNTIME_COMPILER	path	Mac development runs: `dmsh_live.py` from the same checkout as the host. Compiles missing NVN1 vertex and pixel stages with the packer's toolchain and caches them under `DM_TEMP/nvn-shaders`.
 DM_NVN_RUNTIME_PYTHON	path	Mac development runs: the Python executable that runs `DM_NVN_RUNTIME_COMPILER`.
 DM_NVN_RUNTIME_SOURCE	switch	`1` makes the shader compiler emit Metal source for the host to compile with the Metal API. The Mac app launcher sets this when the compiler is bundled.
@@ -256,6 +258,7 @@ DM_NVN_SKIP_FS	diagnostic	`=<fragment key>[,…]` (up to 16) drops all draws of 
 DM_NVN_SKIP_MESH	diagnostic	`=1` drops every task and mesh draw, to measure what they cost in all; the picture is wrong
 DM_NVN_SKIP_SMALL	diagnostic	`=<width>` drops all draws whose target width is at most that, to measure the cost of tiny render passes; the picture is wrong
 DM_NVN_SLICE_MERGE	switch	`0` keeps passes into other layers of one array or cube texture level apart (on by default: they run as one layered pass)
+DM_NVN_SLICE_MRT	switch	`0` slice-merges only passes into one colour target of an array or cube texture, as before; by default passes into several colour targets that step through the same layer together, and into the depth planes of 3D textures, are merged too; `ab` alternates with `DM_AB`
 DM_NVN_SNAPRAW	diagnostic	`=1` makes `DM_NVN_TEXDUMP` also save each target's raw bytes, with a text header line, since converting an HDR target to an 8-bit image truncates
 DM_NVN_SPARSE_COPY	switch	`0` disables per-run shadow copies for misaligned physical mappings in virtual NVN memory pools (on by default, `hle_nvn.c` `vshadow_map`)
 DM_NVN_SPARSE_TILES	switch	`0` makes a sparse texture of 64 MB or more whole, as before; by default it is a Metal placement sparse texture with only the mapped tiles backed
@@ -297,6 +300,7 @@ DM_NVN_UNWRITTEN_DC	switch	`0` disables optional stores elided for loaded, uncha
 DM_NVN_UPLOAD_IDLE_MS	switch	A positive interval in milliseconds enables idle trimming of completed upload staging. Defaults to `0` on all platforms. An explicit `0` keeps the slots and logs their sizes and allocation counts for comparison.
 DM_NVN_UPLOAD_REUSE	switch	0 keeps the original one-block upload-slot policy; default retains bounded demand-sized primary and overflow buffers after completion.
 DM_NVN_UPLOAD_SRC_MB	switch	positive MiB budget for an upload batch's zero-copy source buffers over guest memory; default `0` disables it. Flushes between textures; one oversized texture or a sparse gather can exceed the budget.
+DM_NVN_VBAR_PASS	switch	`0` ends the draw pass at an ordering barrier after vertex-stage shader writes, as before; by default a barrier inside the pass from the vertex stage keeps it (`ab` alternates it with `DM_AB`)
 DM_NVN_VBUF_CACHE	switch	`0` turns off the cache of resolved vertex stream addresses and vertex argument table writes across draws (on by default), for A/B runs
 DM_NVN_VCONV_CHECK	diagnostic	`=1` scans the indices again at every reuse of a cached vertex conversion range (`vconv_range`) and reports differences
 DM_NVN_VCONV_CPU	switch	`=1` converts on the CPU every vertex attribute Metal's fetch cannot read, as before, instead of through the shader's shadow inputs (`<key>_bv`) or its pulling entry (`<key>_bp`)
@@ -338,6 +342,7 @@ DM_PRESENT_SCREEN	switch	`0` turns off the acquire's wait for the screen of `DM_
 DM_PRESENT_SNAP	player	`=<n>`: present snapshots, a ring of n host textures (2 to 4; `1` = 2) the presents are copied to so the game's swapchain texture is free at once; `0` off (default: the profile's `present_snap`)
 DM_PRESENT_UPSCALE	player	`metalfx` scales a picture smaller than its rectangle on the screen through MetalFX's spatial scaler; `off` (the default) scales it bilinearly
 DM_PREV_PROGRAM	switch	What `oe::GetPreviousProgramIndex` answers (default -1, started from HOME); `oe::ExecuteProgram` sets it for the program it starts; a relaunch removes it
+DM_PREWARM_UPLOAD_URL	switch	`=<url>` (`pack_app.py`, `build_ipa.sh`): overrides `dm/services/prewarm-inbox/endpoint.txt` as `DMPrewarmUploadURL` in the packaged app's `Info.plist` for automatic NVN `pso_user.tsv` uploads (empty disables embedding a URL)
 DM_PROBE	diagnostic	`=module:offset,…` (Mac only): puts a `brk` at each guest address and on every hit prints the thread, registers, strings they point to and a backtrace, then runs the original instruction
 DM_PROBE_ALL	diagnostic	Set: probe hits (`DM_PROBE`) also print x8–x18
 DM_PROBE_DUMP	diagnostic	`=module:offset:length[:file]`: on the first hit of any probe, writes that range of guest memory to a file (default `run/<platform>/probe_dump.bin`)
@@ -478,7 +483,7 @@ DM_T_DUMP	test	`tests/t_blend_zero.m` prints the red channel each draw stored, r
 DM_UDC_SELFTEST	diagnostic	`=1` runs a start-up check of DontCare load and store on private depth-stencil and RGBA8 textures (clear, Load + DontCare, read back) and logs one result line
 DM_UE_SHADERS	path	Folder of the Unreal shader code archives decoded by `uepak.py`, for `shader_split.py` (default `ue_shaders` beside the RomFS); needed when the RomFS has Unreal paks
 DM_UE_TEXTURE_POOL	switch	Megabytes Unreal's texture streaming pool (`r.Streaming.PoolSize`) is raised to, overriding the profile's `ue_texture_pool`; `0` keeps the game's own pool. On iOS only this switch turns it on (`Documents/env.txt`)
-DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (agl's NDSR network, found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them
+DM_UPSCALER	player	`metalfx` draws the game's own upscaler shaders (NDSR networks found by the shader map) with MetalFX's spatial scaler; `game` (the default) runs them; `ab` with `DM_AB=<frames>` draws it with MetalFX in every second phase (a measurement in one run)
 DM_VK_CAPTURE	path	`=<dir>` (Mac) writes every SPIR-V module the game creates to `<dir>/<key>.spv`; the NSP script's Vulkan shader capture stage sets it
 DM_VK_LOG	diagnostic	`=1` logs Vulkan object creation in the Vulkan-on-Metal layer
 DM_VSYNC_HZ	switch	`=<Hz>`: rate at which a host thread fires the vi vsync event when the display link does not drive it (default 60)
@@ -494,5 +499,5 @@ DM_XCODE_DERIVED_DATA	path	Xcode derived data folder for `build_ipa.sh` (default
 DM_XCODE_PROJECT_DIR	path	Folder of the per-game Xcode project that `build_ipa.sh --prepare-xcode` makes (default `$W/xcode`); the NSP script sets it
 DM_XUSB	switch	`0` stops reading wired Xbox 360 pads over USB that macOS has no driver for, such as a PDP Xbox 360 pad (`pad_gip_mac.h`, `pad_xusb.h`); Mac only
 DM_XUSB_LOG	diagnostic	`1` logs each decoded state change of a wired Xbox 360 pad read over USB (`pad_gip_mac.h`); Mac only
-DM_YIELD_BACKOFF	switch	`0` turns off the yield back-off; `=<cap µs>[:<start µs>]` sets its sleep cap and the run of yields after which it starts (default 250:2000)
+DM_YIELD_BACKOFF	switch	`0` turns off the yield back-off; `=<cap µs>[:<start µs>]` sets its sleep cap and the run of yields after which it starts (default 250:2000). Fields accept nonnegative integer microseconds through `INT64_MAX/1000`; invalid values fall back to the full default `250:2000`
 DM_YIELD_CLOCK	diagnostic	Clock-reading yield loops: 0 uses ordinary yield backoff, 1 backs off from the start, 2 also sleeps to the predicted end (default)
